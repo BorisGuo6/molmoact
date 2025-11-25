@@ -23,6 +23,7 @@ from .processing_molmoact import MolmoActProcessor
 from .image_processing_molmoact import MolmoActImageProcessor
 
 from omegaconf import OmegaConf
+from pathlib import Path
 
 
 logger = logging.getLogger(__name__)
@@ -228,7 +229,7 @@ def convert_config(model_config: ModelConfig) -> MolmoActConfig:
     return molmoact_config
 
 
-def convert_lm_head_and_prefix(state_dict: dict[str, Any], base_model_prefix: str) -> dict[str, Any]:
+def convert_lm_head_and_prefix(state_dict: dict[str, Any], base_model_prefix: str, weight_tying: bool) -> dict[str, Any]:
     new_state_dict = {}
     for key, val in state_dict.items():
         if key == "transformer.ff_out.weight":
@@ -237,13 +238,16 @@ def convert_lm_head_and_prefix(state_dict: dict[str, Any], base_model_prefix: st
             new_key = f"{base_model_prefix}.{key}"
         new_state_dict[new_key] = val
     
+    if weight_tying:
+        new_state_dict["lm_head.weight"] = state_dict["transformer.wte.embedding"]
+    
     return new_state_dict
 
 
-def convert_molmoact(state_dict: dict[str, Any], config: Union[MolmoActLlmConfig, MolmoActConfig], text_only: bool) -> dict[str, Any]:
+def convert_molmoact(state_dict: dict[str, Any], config: Union[MolmoActLlmConfig, MolmoActConfig], weight_tying: bool, text_only: bool) -> dict[str, Any]:
     if text_only:
         base_model_prefix = MolmoActForCausalLM.base_model_prefix
-        state_dict = convert_lm_head_and_prefix(state_dict, base_model_prefix)
+        state_dict = convert_lm_head_and_prefix(state_dict, base_model_prefix, weight_tying)
         new_state_dict = {}
         for key, val in state_dict.items():
             if 'vision_backbone' in key:
@@ -253,7 +257,7 @@ def convert_molmoact(state_dict: dict[str, Any], config: Union[MolmoActLlmConfig
         model_prefix = base_model_prefix
     else:
         base_model_prefix = MolmoActForActionReasoning.base_model_prefix
-        new_state_dict = convert_lm_head_and_prefix(state_dict, base_model_prefix)
+        new_state_dict = convert_lm_head_and_prefix(state_dict, base_model_prefix, weight_tying)
         model_prefix = f"{base_model_prefix}.transformer"
     qkv_bias = config.qkv_bias if isinstance(config, MolmoActLlmConfig) else config.llm_config.qkv_bias
     use_qk_norm = config.use_qk_norm if isinstance(config, MolmoActLlmConfig) else config.llm_config.use_qk_norm
@@ -301,7 +305,7 @@ def convert_text_only_model(
         raise ValueError(f"Invalid precision: {precision}")
     state_dict = model.state_dict()
 
-    new_state_dict = convert_molmoact(state_dict, hf_config, text_only=True)
+    new_state_dict = convert_molmoact(state_dict, hf_config, model_config.llm.weight_tying, text_only=True)
     hf_model.eval()
     if precision == "bf16":
         hf_model = hf_model.to(torch.bfloat16)
@@ -336,7 +340,7 @@ def convert_model(
         raise ValueError(f"Invalid precision: {precision}")
     state_dict = model.state_dict()
 
-    new_state_dict = convert_molmoact(state_dict, hf_config, text_only=False)
+    new_state_dict = convert_molmoact(state_dict, hf_config, model_config.llm.weight_tying, text_only=False)
     hf_model.eval()
     if precision == "bf16":
         hf_model = hf_model.to(torch.bfloat16)
@@ -356,10 +360,20 @@ def save(
     override_tokenizer: bool,
     chat_template: str,
     precision: str,
+    norm_stats_path: str,
 ) -> None:
     logger.info(f"Loading model config from {checkpoint_dir}")
     config_path = resource_path(checkpoint_dir, "config.yaml")
     model_config: ModelConfig = ModelConfig.load(config_path, key="model", validate_paths=False)
+
+    if norm_stats_path is not None:
+        p = Path(os.path.expandvars(os.path.expanduser(norm_stats_path)))
+        if not p.exists():
+            raise FileNotFoundError(f"norm_stats_path not found: {p}")
+        norm_stats = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(norm_stats, dict):
+            raise TypeError(f"norm_stats JSON root must be an object/dict, got {type(norm_stats).__name__}")
+        model_config.norm_stats = norm_stats
 
     hf_config = convert_config(model_config)
     if text_only:
@@ -534,10 +548,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Convert Molmo checkpoint to HuggingFace format."
     )
-    parser.add_argument("checkpoint_dir", help="Location of Molmo checkpoint.")
-    parser.add_argument("output_dir", help="Location to save the converted checkpoint.")
+    parser.add_argument("--checkpoint_dir", help="Location of Molmo checkpoint.")
+    parser.add_argument("--output_dir", help="Location to save the converted checkpoint.")
     parser.add_argument(
-        "style",
+        "--style",
         type=str,
         help="task style to use for the model",
     )
@@ -563,6 +577,11 @@ def main():
         default="fp32",
         help="Precision to use for the model",
     )
+    parser.add_argument(
+        "--norm_stats_path",
+        default=None,
+        help="Path to the json file with dataset statistics",
+    )
     args = parser.parse_args()
 
     prepare_cli_environment()
@@ -574,6 +593,7 @@ def main():
         args.override_tokenizer,
         args.chat_template,
         args.precision,
+        args.norm_stats_path
     )
 
 
